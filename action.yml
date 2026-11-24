@@ -1,0 +1,264 @@
+name: 'Setup Takumi Guard crates.io Registry'
+description: 'Authenticate to the Takumi byGMO Guard crates.io registry via OIDC. Works with Cargo.'
+author: 'GMO Flatt Security Inc.'
+
+branding:
+  icon: 'shield'
+  color: 'blue'
+
+inputs:
+  bot-id:
+    description: 'Bot ID from Shisho Cloud byGMO console. Omit for anonymous mode (Tier A blocking only).'
+    required: false
+    default: ''
+  sts-url:
+    description: 'STS service URL'
+    required: false
+    default: 'https://sts.cloud.shisho.dev'
+  audience:
+    description: 'Audience for the OIDC token request. Defaults to the STS URL. Override when your Bot trust condition expects a different value.'
+    required: false
+    default: ''
+  registry-url:
+    description: 'crates.io registry URL. An empty value means the default.'
+    required: false
+    default: 'https://crates.flatt.tech'
+  expires-in:
+    description: 'Token expiration in seconds (max 86400)'
+    required: false
+    default: '1800'
+  set-registry:
+    description: 'Write the source replacement for crates.io and the takumi-guard registry to $CARGO_HOME/config.toml. Set to false if you manage the Cargo config yourself; the token is exported either way.'
+    required: false
+    default: 'true'
+
+outputs:
+  token:
+    description: 'The access token for the registry (empty in anonymous mode)'
+    value: ${{ steps.set-outputs.outputs.token }}
+  token-expires-at:
+    description: 'ISO 8601 timestamp when the token expires'
+    value: ${{ steps.set-outputs.outputs.token-expires-at }}
+
+runs:
+  using: 'composite'
+  steps:
+    - name: Authenticate and configure Cargo registry
+      id: auth
+      shell: bash
+      env:
+        BOT_ID: ${{ inputs.bot-id }}
+        STS_URL: ${{ inputs.sts-url }}
+        AUDIENCE_INPUT: ${{ inputs.audience }}
+        REGISTRY_URL: ${{ inputs.registry-url }}
+        EXPIRES_IN: ${{ inputs.expires-in }}
+        SET_REGISTRY: ${{ inputs.set-registry }}
+      run: |
+        set -euo pipefail
+
+        REGISTRY_URL="${REGISTRY_URL:-https://crates.flatt.tech}"
+        REGISTRY_URL_NORMALIZED=$(echo "$REGISTRY_URL" | sed 's|/$||')
+
+        # bot-id was supplied → never silently downgrade to anonymous.
+        fail_with() {
+          echo "::error::$1"
+          exit 1
+        }
+
+        # Cargo reads its user-level config from $CARGO_HOME/config.toml, and
+        # ~/.cargo is only the default. Writing anywhere else is silently
+        # ignored and Cargo fetches from crates.io directly, so resolve the
+        # same directory Cargo will read. On Windows runners CARGO_HOME is a
+        # Windows path; convert it for bash.
+        CARGO_DIR="${CARGO_HOME:-$HOME/.cargo}"
+        if command -v cygpath >/dev/null 2>&1; then
+          CARGO_DIR=$(cygpath -u "$CARGO_DIR")
+        fi
+        CARGO_CONFIG="${CARGO_DIR}/config.toml"
+
+        # The registry requires a token, and Cargo sends registry tokens only
+        # from 1.74 (credential providers). Older Cargo gets 401 on every
+        # resolve even with a token, so fail here, before anything is
+        # configured or a token is issued. Without Cargo on the runner yet
+        # (a toolchain installed by a later step), the version cannot be
+        # read; the config is written anyway.
+        if command -v cargo >/dev/null 2>&1; then
+          CARGO_VERSION_LINE=$(cargo --version 2>/dev/null | head -n 1 || true)
+          CARGO_MAJOR=$(printf '%s' "$CARGO_VERSION_LINE" | sed -n 's/^cargo \([0-9][0-9]*\)\..*/\1/p')
+          CARGO_MINOR=$(printf '%s' "$CARGO_VERSION_LINE" | sed -n 's/^cargo [0-9][0-9]*\.\([0-9][0-9]*\).*/\1/p')
+          if [ -z "$CARGO_MAJOR" ] || [ -z "$CARGO_MINOR" ]; then
+            fail_with "Could not read the Cargo version from 'cargo --version'. This action requires Cargo 1.74 or later."
+          fi
+          if [ "$CARGO_MAJOR" -lt 1 ] || { [ "$CARGO_MAJOR" -eq 1 ] && [ "$CARGO_MINOR" -lt 74 ]; }; then
+            fail_with "Cargo ${CARGO_MAJOR}.${CARGO_MINOR} cannot send a token to a registry, and Takumi Guard requires one. This action requires Cargo 1.74 or later; run jobs that build with an older toolchain (for example an MSRV check) without this action."
+          fi
+        else
+          echo "::warning::Cargo was not found, so its version (1.74 or later is required) could not be checked. Install the Rust toolchain before this action."
+        fi
+
+        BEGIN_MARK='# >>> setup-takumi-guard-crates >>>'
+        END_MARK='# <<< setup-takumi-guard-crates <<<'
+
+        # Writes the managed block to $CARGO_CONFIG. A block written by an
+        # earlier run of this action is replaced, so re-running is idempotent.
+        # Any other [source.crates-io] or [registries.takumi-guard] table is
+        # left alone and the step fails instead: TOML forbids a table twice,
+        # and silently overriding the user's own source replacement could
+        # route crates elsewhere.
+        write_registry() {
+          if [ "$SET_REGISTRY" = "false" ]; then
+            return 0
+          fi
+          mkdir -p "$CARGO_DIR"
+          if [ -f "$CARGO_CONFIG" ]; then
+            awk -v b="$BEGIN_MARK" -v e="$END_MARK" '
+              $0 == b { skip = 1; next }
+              $0 == e { skip = 0; next }
+              !skip { print }
+            ' "$CARGO_CONFIG" > "${CARGO_CONFIG}.tmp" && mv "${CARGO_CONFIG}.tmp" "$CARGO_CONFIG"
+            if grep -Eq '^[[:space:]]*\[[[:space:]]*(source\.crates-io|source\."crates-io"|registries\.takumi-guard|registries\."takumi-guard")[[:space:]]*\]' "$CARGO_CONFIG"; then
+              fail_with "${CARGO_CONFIG} already defines [source.crates-io] or [registries.takumi-guard]. Remove it, or set set-registry: false and configure Takumi Guard yourself."
+            fi
+          fi
+          {
+            echo "$BEGIN_MARK"
+            echo '[source.crates-io]'
+            echo 'replace-with = "takumi-guard"'
+            echo ''
+            echo '[registries.takumi-guard]'
+            echo "index = \"sparse+${REGISTRY_URL_NORMALIZED}/\""
+            echo 'credential-provider = "cargo:token"'
+            echo "$END_MARK"
+          } >> "$CARGO_CONFIG"
+          echo "::notice::crates.io replaced by ${REGISTRY_URL_NORMALIZED} in ${CARGO_CONFIG}"
+        }
+
+        # Always clean up curl response bodies, even on early-exit paths.
+        OIDC_BODY=""
+        STS_BODY=""
+        trap 'rm -f "${OIDC_BODY:-}" "${STS_BODY:-}"' EXIT
+
+        if [ -z "$BOT_ID" ]; then
+          echo "::notice::No bot-id provided — running in anonymous mode (Tier A blocking)"
+          write_registry
+          # The registry always asks for a token; "anonymous" is the
+          # placeholder Guard serves as unauthenticated (Tier A).
+          echo "CARGO_REGISTRIES_TAKUMI_GUARD_TOKEN=anonymous" >> "$GITHUB_ENV"
+          exit 0
+        fi
+
+        if [ -z "${ACTIONS_ID_TOKEN_REQUEST_URL:-}" ] || [ -z "${ACTIONS_ID_TOKEN_REQUEST_TOKEN:-}" ]; then
+          fail_with "OIDC not available. Add 'permissions: { id-token: write }' to your job."
+        fi
+
+        # --- OIDC token fetch ---
+        # The audience names the verifier of the token, which is the STS; it
+        # is also the console's default audience for trust conditions.
+        # Normalized without a trailing slash because STS matches it as an
+        # exact string.
+        STS_URL_NORMALIZED=$(echo "$STS_URL" | sed 's|/$||')
+        if [ -n "$AUDIENCE_INPUT" ]; then
+          OIDC_AUDIENCE="$AUDIENCE_INPUT"
+        else
+          OIDC_AUDIENCE="$STS_URL_NORMALIZED"
+        fi
+
+        OIDC_BODY=$(mktemp)
+        OIDC_CURL_EXIT=0
+        OIDC_CODE=$(curl -sS -o "$OIDC_BODY" -w '%{http_code}' \
+          --max-time 15 --connect-timeout 5 \
+          --retry 3 --retry-delay 2 --retry-connrefused --retry-all-errors \
+          -H "Authorization: bearer ${ACTIONS_ID_TOKEN_REQUEST_TOKEN}" \
+          -G --data-urlencode "audience=${OIDC_AUDIENCE}" \
+          "${ACTIONS_ID_TOKEN_REQUEST_URL}") || OIDC_CURL_EXIT=$?
+
+        if [ "$OIDC_CURL_EXIT" -ne 0 ]; then
+          fail_with "GitHub OIDC token fetch failed: curl exit ${OIDC_CURL_EXIT} (network/timeout to token.actions.githubusercontent.com)."
+        fi
+        if [ "$OIDC_CODE" != "200" ]; then
+          echo "::error::GitHub OIDC token endpoint returned HTTP ${OIDC_CODE}."
+          head -c 500 "$OIDC_BODY" | sed 's/^/::error::oidc body: /' || true
+          exit 1
+        fi
+
+        # jq 1.6 exits 4 and jq 1.7 exits 5 on non-JSON input; validate first.
+        if ! jq -e . "$OIDC_BODY" >/dev/null 2>&1; then
+          echo "::error::GitHub OIDC token endpoint returned non-JSON (HTTP ${OIDC_CODE})."
+          head -c 500 "$OIDC_BODY" | sed 's/^/::error::oidc body: /' || true
+          exit 1
+        fi
+        OIDC_TOKEN=$(jq -r '.value // empty' "$OIDC_BODY")
+        rm -f "$OIDC_BODY"
+
+        if [ -z "$OIDC_TOKEN" ]; then
+          fail_with "GitHub OIDC token response missing 'value' field."
+        fi
+        echo "::add-mask::${OIDC_TOKEN}"
+
+        # --- STS exchange ---
+        STS_BODY=$(mktemp)
+        STS_CURL_EXIT=0
+        STS_CODE=$(curl -sS -o "$STS_BODY" -w '%{http_code}' \
+          --max-time 15 --connect-timeout 5 \
+          --retry 3 --retry-delay 2 --retry-connrefused --retry-all-errors \
+          -X POST "${STS_URL}/bots/exchange" \
+          -H "Content-Type: application/json" \
+          -d "{\"bot_id\": \"${BOT_ID}\", \"id_token\": \"${OIDC_TOKEN}\", \"expires_in\": ${EXPIRES_IN}}") || STS_CURL_EXIT=$?
+
+        if [ "$STS_CURL_EXIT" -ne 0 ]; then
+          fail_with "STS exchange failed: curl exit ${STS_CURL_EXIT} (network/timeout reaching ${STS_URL})."
+        fi
+
+        if ! jq -e . "$STS_BODY" >/dev/null 2>&1; then
+          echo "::error::STS returned non-JSON (HTTP ${STS_CODE}). Usually indicates an outage upstream of STS."
+          head -c 500 "$STS_BODY" | sed 's/^/::error::sts body: /' || true
+          exit 1
+        fi
+
+        ACCESS_TOKEN=$(jq -r '.access_token // empty' "$STS_BODY")
+        EXPIRES_IN_ACTUAL=$(jq -r '.expires_in // 1800' "$STS_BODY")
+        STS_ERROR=$(jq -r '.message // .error // empty' "$STS_BODY")
+        rm -f "$STS_BODY"
+
+        if [ -z "$ACCESS_TOKEN" ]; then
+          if [ "$STS_CODE" = "401" ] || [ "$STS_CODE" = "403" ]; then
+            fail_with "STS rejected bot-id (HTTP ${STS_CODE}): ${STS_ERROR:-no message}. Check that bot-id is valid and the workflow's OIDC subject is allowed."
+          fi
+          fail_with "STS returned HTTP ${STS_CODE} without an access_token: ${STS_ERROR:-no message}."
+        fi
+        echo "::add-mask::${ACCESS_TOKEN}"
+
+        # Cargo's cargo:token provider reads CARGO_REGISTRIES_<NAME>_TOKEN and
+        # sends the value verbatim as the Authorization header, so the value
+        # carries the Bearer scheme. Written to $GITHUB_ENV so every later step
+        # of the job has it.
+        echo "CARGO_REGISTRIES_TAKUMI_GUARD_TOKEN=Bearer ${ACCESS_TOKEN}" >> "$GITHUB_ENV"
+
+        # Configure the registry only after authentication succeeded, so a
+        # failed exchange never leaves Cargo pointed at Guard without a token.
+        write_registry
+
+        echo "token=${ACCESS_TOKEN}" >> "$GITHUB_OUTPUT"
+
+        EXPIRES_AT=$(date -u -d "+${EXPIRES_IN_ACTUAL} seconds" +%Y-%m-%dT%H:%M:%SZ 2>/dev/null \
+                     || date -u -v+"${EXPIRES_IN_ACTUAL}"S +%Y-%m-%dT%H:%M:%SZ 2>/dev/null \
+                     || echo "")
+        if [ -n "$EXPIRES_AT" ]; then
+          echo "expires_at=${EXPIRES_AT}" >> "$GITHUB_OUTPUT"
+        fi
+        echo "::notice::Authenticated as bot ${BOT_ID} (Tier C)"
+
+    - name: Set outputs
+      id: set-outputs
+      shell: bash
+      env:
+        ACCESS_TOKEN: ${{ steps.auth.outputs.token }}
+        EXPIRES_AT: ${{ steps.auth.outputs.expires_at }}
+      run: |
+        if [ -n "$ACCESS_TOKEN" ]; then
+          echo "::add-mask::${ACCESS_TOKEN}"
+          echo "token=${ACCESS_TOKEN}" >> "$GITHUB_OUTPUT"
+        fi
+        if [ -n "$EXPIRES_AT" ]; then
+          echo "token-expires-at=${EXPIRES_AT}" >> "$GITHUB_OUTPUT"
+        fi

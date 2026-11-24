@@ -1,0 +1,357 @@
+name: Test
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+# The integration jobs fetch real crates through the registry in
+# TEST_REGISTRY_URL. An empty value runs them against the action's shipped
+# default (https://crates.flatt.tech), so a regression in that default fails CI.
+# No job needs to write: the integration jobs only read the checkout and
+# fetch crates, and the stand-in jobs mint no real token.
+permissions:
+  contents: read
+
+# Toolchains come from the rustup preinstalled on the GitHub-hosted runners,
+# so the only third-party code CI runs is GitHub's own actions/checkout.
+env:
+  TEST_REGISTRY_URL: ${{ vars.TEST_REGISTRY_URL }}
+  CARGO_TERM_COLOR: never
+
+jobs:
+  lint:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+
+      - name: Validate action.yml
+        run: |
+          python3 -c "import yaml; yaml.safe_load(open('action.yml'))"
+          echo "action.yml is valid YAML"
+
+      - name: Check required fields
+        run: |
+          grep -q 'using:.*composite' action.yml
+          grep -q "bot-id:" action.yml
+          grep -q "set-registry:" action.yml
+          grep -q "crates.flatt.tech" action.yml
+          echo "Required fields present"
+
+  integration-anonymous:
+    name: anonymous mode fetches through Guard
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+      - name: Rust stable
+        run: rustup toolchain install stable --profile minimal --no-self-update && rustup default stable
+
+      - uses: ./
+        id: guard
+        with:
+          registry-url: ${{ env.TEST_REGISTRY_URL }}
+
+      - name: The placeholder token is exported and no token output is set
+        env:
+          TOKEN: ${{ steps.guard.outputs.token }}
+        run: |
+          [ "${CARGO_REGISTRIES_TAKUMI_GUARD_TOKEN:-}" = anonymous ] \
+            || { echo "::error::CARGO_REGISTRIES_TAKUMI_GUARD_TOKEN is not 'anonymous'"; exit 1; }
+          [ -z "$TOKEN" ] || { echo "::error::the token output was set without bot-id"; exit 1; }
+
+      - name: The config Cargo reads replaces crates.io
+        run: |
+          dir="${CARGO_HOME:-$HOME/.cargo}"
+          cat "$dir/config.toml"
+          grep -q 'replace-with = "takumi-guard"' "$dir/config.toml"
+          grep -q 'credential-provider = "cargo:token"' "$dir/config.toml"
+
+      - name: A bogus token is refused, so Cargo really goes through Guard
+        run: |
+          cd "$(mktemp -d)" && mkdir src
+          echo 'fn main(){}' > src/main.rs
+          printf '[package]\nname = "neg"\nversion = "0.1.0"\nedition = "2021"\n\n[dependencies]\nitoa = "1"\n' > Cargo.toml
+          if CARGO_REGISTRIES_TAKUMI_GUARD_TOKEN="Bearer tg_anon_bogusXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXX" cargo fetch > fetch.log 2>&1; then
+            cat fetch.log; echo "::error::a bogus token was accepted — Cargo is not fetching through Guard"; exit 1
+          fi
+          cat fetch.log
+          grep -q '401' fetch.log || { echo "::error::the failure is not the registry's 401"; exit 1; }
+
+      - name: A crate is fetched through the takumi-guard registry
+        run: |
+          cd "$(mktemp -d)" && mkdir src
+          echo 'fn main(){}' > src/main.rs
+          printf '[package]\nname = "probe"\nversion = "0.1.0"\nedition = "2021"\n\n[dependencies]\nitoa = "1"\n' > Cargo.toml
+          cargo fetch -v 2>&1 | tee fetch.log
+          grep -q 'Downloaded itoa .*(registry `takumi-guard`)' fetch.log \
+            || { echo "::error::itoa was not downloaded from the takumi-guard registry"; exit 1; }
+          grep -q 'source = "registry+https://github.com/rust-lang/crates.io-index"' Cargo.lock \
+            || { echo "::error::Cargo.lock does not record crates.io as the source"; exit 1; }
+
+      - name: A blocked crate is refused
+        run: |
+          cd "$(mktemp -d)" && mkdir src
+          echo 'fn main(){}' > src/main.rs
+          printf '[package]\nname = "blocked"\nversion = "0.1.0"\nedition = "2021"\n\n[dependencies]\nhola-takumi = "*"\n' > Cargo.toml
+          if cargo fetch > fetch.log 2>&1; then
+            cat fetch.log; echo "::error::the sentinel hola-takumi (blocked as a whole crate) was fetched"; exit 1
+          fi
+          cat fetch.log
+          grep -q '403' fetch.log || { echo "::error::the failure is not Guard's 403"; exit 1; }
+
+  rerun-idempotent:
+    name: running the action twice leaves one managed block and keeps the user's settings
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+      - name: Rust stable
+        run: rustup toolchain install stable --profile minimal --no-self-update && rustup default stable
+      - name: Settings of the user's own
+        run: |
+          cfg="${CARGO_HOME:-$HOME/.cargo}/config.toml"
+          mkdir -p "$(dirname "$cfg")"
+          printf '[build]\njobs = 2\n\n[net]\nretry = 3\n' >> "$cfg"
+      - uses: ./
+      - uses: ./
+      - name: One block, one [source.crates-io], the user's settings kept
+        run: |
+          cfg="${CARGO_HOME:-$HOME/.cargo}/config.toml"
+          cat "$cfg"
+          [ "$(grep -c '^\[source.crates-io\]' "$cfg")" = 1 ] || { echo "::error::[source.crates-io] written more than once"; exit 1; }
+          [ "$(grep -c '^# >>> setup-takumi-guard-crates >>>' "$cfg")" = 1 ] || { echo "::error::the managed block written more than once"; exit 1; }
+          grep -q '^jobs = 2' "$cfg" || { echo "::error::the user's [build] was lost"; exit 1; }
+          grep -q '^retry = 3' "$cfg" || { echo "::error::the user's [net] was lost"; exit 1; }
+
+  existing-source-replacement:
+    name: an existing ${{ matrix.table }} fails the step and is kept
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        table: ['[source.crates-io]', '[source."crates-io"]', '[registries.takumi-guard]']
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+      - name: Rust stable
+        run: rustup toolchain install stable --profile minimal --no-self-update && rustup default stable
+      - name: Configure a table of the user's own
+        env:
+          TABLE: ${{ matrix.table }}
+        run: |
+          cfg="${CARGO_HOME:-$HOME/.cargo}/config.toml"
+          mkdir -p "$(dirname "$cfg")"
+          printf '%s\nreplace-with = "mirror"\n\n[source.mirror]\nregistry = "sparse+https://mirror.example/"\n' "$TABLE" >> "$cfg"
+          sha256sum "$cfg" > "$RUNNER_TEMP/before.sha"
+      - uses: ./
+        id: guard
+        continue-on-error: true
+      - name: The step failed and the user's config is untouched
+        env:
+          OUTCOME: ${{ steps.guard.outcome }}
+        run: |
+          cfg="${CARGO_HOME:-$HOME/.cargo}/config.toml"
+          [ "$OUTCOME" = failure ] || { cat "$cfg"; echo "::error::the action ended with '${OUTCOME}'"; exit 1; }
+          sha256sum -c "$RUNNER_TEMP/before.sha" || { cat "$cfg"; echo "::error::the user's config was changed"; exit 1; }
+
+  old-cargo:
+    name: with Cargo older than 1.74 the step fails before configuring anything
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+      - name: Rust 1.73.0
+        run: rustup toolchain install 1.73.0 --profile minimal --no-self-update && rustup default 1.73.0
+      - uses: ./
+        id: guard
+        continue-on-error: true
+      - name: The step failed and wrote no config or token
+        env:
+          OUTCOME: ${{ steps.guard.outcome }}
+        run: |
+          [ "$OUTCOME" = failure ] || { echo "::error::the action ended with '${OUTCOME}' on Cargo 1.73"; exit 1; }
+          ! grep -qs 'takumi-guard' "${CARGO_HOME:-$HOME/.cargo}/config.toml" || { echo "::error::the registry was configured"; exit 1; }
+          [ -z "${CARGO_REGISTRIES_TAKUMI_GUARD_TOKEN:-}" ] || { echo "::error::a token was exported"; exit 1; }
+
+  bot-standin:
+    name: with bot-id the exchanged token reaches Cargo with the Bearer scheme
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+      - name: Rust stable
+        run: rustup toolchain install stable --profile minimal --no-self-update && rustup default stable
+
+      - name: Stand-in OIDC and STS endpoints
+        run: |
+          nohup env STANDIN_LOG="$RUNNER_TEMP/standin.log" python3 .github/test/standin.py >/dev/null 2>&1 &
+          for _ in $(seq 1 20); do curl -fsS http://127.0.0.1:18080/ >/dev/null 2>&1 && break; sleep 0.5; done
+
+      - uses: ./
+        id: guard
+        env:
+          ACTIONS_ID_TOKEN_REQUEST_URL: http://127.0.0.1:18080/oidc
+          ACTIONS_ID_TOKEN_REQUEST_TOKEN: unused
+        with:
+          bot-id: standin-bot
+          sts-url: http://127.0.0.1:18080
+
+      - name: Token exported with Bearer, outputs set, audience is the STS URL
+        env:
+          TOKEN: ${{ steps.guard.outputs.token }}
+          EXPIRES_AT: ${{ steps.guard.outputs.token-expires-at }}
+        run: |
+          [ "${CARGO_REGISTRIES_TAKUMI_GUARD_TOKEN:-}" = "Bearer standin-guard-token" ] || { echo "::error::the exported token is not 'Bearer <token>'"; exit 1; }
+          [ "$TOKEN" = standin-guard-token ] || { echo "::error::the token output was not set"; exit 1; }
+          [ -n "$EXPIRES_AT" ] || { echo "::error::token-expires-at was not set"; exit 1; }
+          grep -qi 'audience=http%3A%2F%2F127.0.0.1%3A18080' "$RUNNER_TEMP/standin.log" || { cat "$RUNNER_TEMP/standin.log"; echo "::error::the OIDC audience is not the STS URL"; exit 1; }
+          grep -q 'takumi-guard' "${CARGO_HOME:-$HOME/.cargo}/config.toml"
+
+  bot-rejected:
+    name: a rejected exchange fails the step and configures nothing
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+      - name: Rust stable
+        run: rustup toolchain install stable --profile minimal --no-self-update && rustup default stable
+
+      - name: Stand-in OIDC and STS endpoints
+        run: |
+          nohup python3 .github/test/standin.py >/dev/null 2>&1 &
+          for _ in $(seq 1 20); do curl -fsS http://127.0.0.1:18080/ >/dev/null 2>&1 && break; sleep 0.5; done
+
+      - uses: ./
+        id: guard
+        continue-on-error: true
+        env:
+          ACTIONS_ID_TOKEN_REQUEST_URL: http://127.0.0.1:18080/oidc
+          ACTIONS_ID_TOKEN_REQUEST_TOKEN: unused
+        with:
+          bot-id: standin-bot
+          sts-url: http://127.0.0.1:18080/reject
+
+      - name: The step failed and left no token or registry behind
+        env:
+          OUTCOME: ${{ steps.guard.outcome }}
+          TOKEN: ${{ steps.guard.outputs.token }}
+        run: |
+          [ "$OUTCOME" = failure ] || { echo "::error::the action ended with '${OUTCOME}'"; exit 1; }
+          [ -z "$TOKEN" ] || { echo "::error::the token output was set"; exit 1; }
+          [ -z "${CARGO_REGISTRIES_TAKUMI_GUARD_TOKEN:-}" ] || { echo "::error::a token was exported"; exit 1; }
+          ! grep -qs 'takumi-guard' "${CARGO_HOME:-$HOME/.cargo}/config.toml" || { echo "::error::the registry was configured"; exit 1; }
+
+  no-cargo:
+    name: without Cargo on PATH the step warns and still configures the registry
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+      - name: Cargo is not reachable on the PATH the action gets
+        run: |
+          ! env PATH=/usr/local/bin:/usr/bin:/bin sh -c 'command -v cargo' || { echo "::error::cargo is still on the trimmed PATH"; exit 1; }
+      - uses: ./
+        id: guard
+        env:
+          PATH: /usr/local/bin:/usr/bin:/bin
+      - name: The step succeeded and configured the registry
+        env:
+          OUTCOME: ${{ steps.guard.outcome }}
+        run: |
+          [ "$OUTCOME" = success ] || { echo "::error::the action ended with '${OUTCOME}'"; exit 1; }
+          grep -q 'replace-with = "takumi-guard"' "${CARGO_HOME:-$HOME/.cargo}/config.toml" || { echo "::error::the registry was not configured"; exit 1; }
+          [ "${CARGO_REGISTRIES_TAKUMI_GUARD_TOKEN:-}" = anonymous ] || { echo "::error::the placeholder token was not exported"; exit 1; }
+
+  set-registry-false:
+    name: with set-registry false the token is exported and the Cargo config is untouched
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+      - name: Rust stable
+        run: rustup toolchain install stable --profile minimal --no-self-update && rustup default stable
+
+      - name: Stand-in OIDC and STS endpoints
+        run: |
+          nohup python3 .github/test/standin.py >/dev/null 2>&1 &
+          for _ in $(seq 1 20); do curl -fsS http://127.0.0.1:18080/ >/dev/null 2>&1 && break; sleep 0.5; done
+
+      - name: Record the Cargo config before the action
+        run: |
+          cfg="${CARGO_HOME:-$HOME/.cargo}/config.toml"
+          if [ -f "$cfg" ]; then sha256sum "$cfg"; else echo absent; fi > "$RUNNER_TEMP/before.txt"
+
+      - uses: ./
+        id: guard
+        env:
+          ACTIONS_ID_TOKEN_REQUEST_URL: http://127.0.0.1:18080/oidc
+          ACTIONS_ID_TOKEN_REQUEST_TOKEN: unused
+        with:
+          bot-id: standin-bot
+          sts-url: http://127.0.0.1:18080
+          set-registry: false
+
+      - name: Token exported, Cargo config unchanged
+        env:
+          TOKEN: ${{ steps.guard.outputs.token }}
+        run: |
+          cfg="${CARGO_HOME:-$HOME/.cargo}/config.toml"
+          [ "${CARGO_REGISTRIES_TAKUMI_GUARD_TOKEN:-}" = "Bearer standin-guard-token" ] || { echo "::error::the exported token is not 'Bearer <token>'"; exit 1; }
+          [ "$TOKEN" = standin-guard-token ] || { echo "::error::the token output was not set"; exit 1; }
+          if [ -f "$cfg" ]; then sha256sum "$cfg"; else echo absent; fi > "$RUNNER_TEMP/after.txt"
+          diff "$RUNNER_TEMP/before.txt" "$RUNNER_TEMP/after.txt" || { cat "$cfg"; echo "::error::the Cargo config was changed"; exit 1; }
+
+  audience-override:
+    name: the audience input overrides the STS URL as the OIDC audience
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+      - name: Rust stable
+        run: rustup toolchain install stable --profile minimal --no-self-update && rustup default stable
+
+      - name: Stand-in OIDC and STS endpoints
+        run: |
+          nohup env STANDIN_LOG="$RUNNER_TEMP/standin.log" python3 .github/test/standin.py >/dev/null 2>&1 &
+          for _ in $(seq 1 20); do curl -fsS http://127.0.0.1:18080/ >/dev/null 2>&1 && break; sleep 0.5; done
+
+      - uses: ./
+        env:
+          ACTIONS_ID_TOKEN_REQUEST_URL: http://127.0.0.1:18080/oidc
+          ACTIONS_ID_TOKEN_REQUEST_TOKEN: unused
+        with:
+          bot-id: standin-bot
+          sts-url: http://127.0.0.1:18080
+          audience: https://audience.example/custom
+
+      - name: The OIDC request carried the given audience
+        run: |
+          cat "$RUNNER_TEMP/standin.log"
+          grep -qi '^GET /oidc?audience=https%3A%2F%2Faudience.example%2Fcustom$' "$RUNNER_TEMP/standin.log" || { echo "::error::the OIDC audience is not the audience input"; exit 1; }
+
+  oidc-unavailable:
+    name: with bot-id but no id-token permission the step fails and configures nothing
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+      - name: Rust stable
+        run: rustup toolchain install stable --profile minimal --no-self-update && rustup default stable
+
+      - uses: ./
+        id: guard
+        continue-on-error: true
+        with:
+          bot-id: some-bot
+
+      - name: The step failed and left no token or registry behind
+        env:
+          OUTCOME: ${{ steps.guard.outcome }}
+          TOKEN: ${{ steps.guard.outputs.token }}
+        run: |
+          [ "$OUTCOME" = failure ] || { echo "::error::the action ended with '${OUTCOME}'"; exit 1; }
+          [ -z "$TOKEN" ] || { echo "::error::the token output was set"; exit 1; }
+          [ -z "${CARGO_REGISTRIES_TAKUMI_GUARD_TOKEN:-}" ] || { echo "::error::a token was exported"; exit 1; }
+          ! grep -qs 'takumi-guard' "${CARGO_HOME:-$HOME/.cargo}/config.toml" || { echo "::error::the registry was configured"; exit 1; }
